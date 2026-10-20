@@ -48,6 +48,83 @@ export interface KikisAppFastifyOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Request body buffering
+//
+// Fastify's request.raw is a Node IncomingMessage stream. Payment verification
+// hooks may read from it (or Fastify's own body parser may have already
+// consumed it). To guarantee downstream route handlers receive the complete
+// payload, we buffer the raw stream once and replay it via a fresh Readable
+// that is swapped in for request.raw. The buffered bytes are also exposed as
+// request.body when Fastify has not already parsed a body.
+// ---------------------------------------------------------------------------
+
+/** Upper bound on buffered request body size (bytes). Guards against unbounded
+ * memory use from high-volume streaming payloads. */
+const MAX_BUFFERED_BODY_BYTES = 10 * 1024 * 1024
+
+/**
+ * Buffer the raw request stream and install a replayable replacement so that
+ * both payment verification and the downstream route handler can read the
+ * full body. Safe to call multiple times; only buffers once per request.
+ */
+async function bufferRequestBody(fastifyRequest: FastifyRequest): Promise<void> {
+  const raw = fastifyRequest.raw as IncomingMessage & { __kikisBodyBuffered?: boolean }
+  if (raw.__kikisBodyBuffered) return
+  raw.__kikisBodyBuffered = true
+
+  // If Fastify already parsed a body, the stream is drained; nothing to buffer.
+  if (fastifyRequest.body !== undefined && fastifyRequest.body !== null) return
+
+  const method = (raw.method ?? 'GET').toUpperCase()
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return
+
+  const chunks: Buffer[] = []
+  let total = 0
+  try {
+    for await (const chunk of raw) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string)
+      total += buf.length
+      if (total > MAX_BUFFERED_BODY_BYTES) {
+        // Refuse to buffer unbounded payloads; leave the stream as-is so the
+        // route handler can still consume it directly.
+        return
+      }
+      chunks.push(buf)
+    }
+  } catch {
+    // Stream already consumed or errored — leave it untouched.
+    return
+  }
+
+  const body = Buffer.concat(chunks)
+
+  // Expose parsed body when possible so Fastify route handlers see it.
+  if (body.length > 0 && fastifyRequest.body === undefined) {
+    const contentType = String(raw.headers['content-type'] ?? '')
+    if (contentType.includes('application/json')) {
+      try {
+        fastifyRequest.body = JSON.parse(body.toString('utf8'))
+      } catch {
+        // Not valid JSON — leave body undefined; raw replay still works.
+      }
+    }
+  }
+
+  // Replace the drained stream with a fresh Readable that replays the bytes.
+  const { Readable } = await import('node:stream')
+  const replay = Readable.from(body.length > 0 ? [body] : [])
+  // Preserve the original request metadata the route handler may rely on.
+  Object.assign(replay, {
+    headers: raw.headers,
+    method: raw.method,
+    url: raw.url,
+    httpVersion: raw.httpVersion,
+    socket: raw.socket,
+  })
+  fastifyRequest.raw = replay as unknown as IncomingMessage
+}
+
+// ---------------------------------------------------------------------------
 // Express-compatible shim over Node's raw http objects
 //
 // Fastify's request.raw / reply.raw are plain Node IncomingMessage /

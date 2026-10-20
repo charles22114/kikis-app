@@ -79,6 +79,12 @@ export interface MppSessionHandlerOptions {
    * session mode (mirrors the Hono adapter's shared session state).
    */
   mode?: 'mpp-session' | 'mpp-session-ws'
+  /**
+   * Externally-owned store for channel session state. Inject a durable
+   * backend (Redis, Supabase, etc.) to survive multi-process clusters and
+   * restarts. Defaults to a fresh in-memory store when omitted.
+   */
+  sessionStore?: ChannelStore
   onSettled?: (txHash: string, totalPaid: string, mode: string, payer: string | null) => Promise<void>
   onSessionOpen?: (channelId: string, payer: string | null) => Promise<void>
   onVoucher?: (channelId: string, voucherIndex: number, cumulativeAmount: string, signature: string) => Promise<void>
@@ -428,11 +434,9 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
               }
             }
           }
-
-          res.json({ closeTxHash })
-        } else {
-          res.json({ closeTxHash: null, message: 'no vouchers received' })
         }
+      }
+      armIdleTimer()
 
         // Clean up per-channel state so memory doesn't grow unboundedly (#58).
         await state.innerStore.delete(voucherRecordKey(channelId))
@@ -441,26 +445,19 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
         return
       }
 
-      const fetchReq = MppxRequest.fromNodeListener(req, res)
-
-      const result = await (mppx as unknown as {
-        channel: (o: { amount: string; description?: string }) =>
-          (r: globalThis.Request) => Promise<{
-            status: number
-            challenge?: globalThis.Response
-            withReceipt?: (r: globalThis.Response) => globalThis.Response
-          }>
-      }).channel({
-        amount: rateHuman,
-        description: opts.manifest.name,
-      })(fetchReq)
-
+      const mppxReq = new MppxRequest({
+        method: req.method,
+        url: req.originalUrl ?? req.url,
+        headers: req.headers as Record<string, string>,
+        body: req.body,
+      })
+      const result = await withTypedChannelErrors(() => mppx.handle(mppxReq))
       if (result.status === 402) {
-        const challenge = result.challenge!
         res.status(402)
-        challenge.headers.forEach((v: string, k: string) => res.setHeader(k, v))
-        const body = await challenge.text()
-        res.send(body)
+        for (const [key, value] of Object.entries(result.headers ?? {})) {
+          res.setHeader(key, value as string)
+        }
+        res.send(result.body ?? '')
         return
       }
 
@@ -476,4 +473,6 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
       next(err)
     }
   }
+
+  return handler
 }

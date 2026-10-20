@@ -209,6 +209,42 @@ export function createX402Handler(opts: X402HandlerOptions): RequestHandler {
         }
       }
 
+      // Malformed payment header response: HTTP 400 with a typed error body and
+      // fresh payment requirements so the client can retry with a valid header.
+      // Never leaks internal stack traces.
+      const respondMalformedHeader = async (): Promise<void> => {
+        const body = { error: 'malformed_payment_header' }
+        if (ozServer) {
+          const resourceInfo = {
+            url: `${req.protocol}://${req.get('host') ?? ''}${req.originalUrl}`,
+            description: opts.manifest.name,
+          }
+          const paymentRequired = await ozServer.createPaymentRequiredResponse(
+            [requirements],
+            resourceInfo,
+          )
+          res
+            .status(400)
+            .setHeader('Content-Type', 'application/json')
+            .setHeader('X-Payment-Requirements', encodePaymentRequiredHeader(paymentRequired))
+            .json(body)
+        } else {
+          const x402Response = {
+            x402Version: 2,
+            resource: {
+              url: `${req.protocol}://${req.get('host') ?? ''}${req.originalUrl}`,
+              description: opts.manifest.name,
+            },
+            accepts: [requirements],
+          }
+          res
+            .status(400)
+            .setHeader('Content-Type', 'application/json')
+            .setHeader('X-Payment-Requirements', encodePaymentRequiredHeader(x402Response))
+            .json(body)
+        }
+      }
+
       const paymentHeader = (req.headers['payment-signature'] ?? req.headers['x-payment']) as string | undefined
 
       if (!paymentHeader) {
