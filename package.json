@@ -4,7 +4,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "dev": "pnpm -r --parallel dev",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm -r --if-present run typecheck",
     "lint": "pnpm -r lint",
     "format:check": "prettier --check .",
     "stress:test": "pnpm --filter agent stress",
