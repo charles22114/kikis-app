@@ -22,6 +22,25 @@ const MPP_NETWORK: Record<Network, 'stellar:testnet' | 'stellar:pubnet'> = {
   mainnet: 'stellar:pubnet',
 }
 
+/**
+ * Returns true when a `payment-signature` header is present but cannot be
+ * decoded as base64 JSON. Malformed headers must surface as a clean 400 rather
+ * than bubbling up as an unhandled 500 from the mppx library.
+ */
+function isMalformedPaymentSignature(header: unknown): boolean {
+  if (header === undefined || header === null) return false
+  if (typeof header !== 'string') return true
+  const trimmed = header.trim()
+  if (trimmed.length === 0) return true
+  try {
+    const decoded = Buffer.from(trimmed, 'base64').toString('utf8')
+    const parsed = JSON.parse(decoded)
+    return parsed === null || typeof parsed !== 'object'
+  } catch {
+    return true
+  }
+}
+
 export interface MppChargeHandlerOptions {
   payeeSecretKey: string
   network: Network
@@ -82,6 +101,14 @@ export function createMppChargeHandler(opts: MppChargeHandlerOptions): RequestHa
         opts.assetContract,
       )
       const mppx = getMppx(assetContract)
+
+      // Reject malformed `payment-signature` headers up front with a clean 400
+      // instead of letting the mppx decoder throw an unhandled 500.
+      if (isMalformedPaymentSignature(req.headers['payment-signature'])) {
+        res.status(400).json({ error: 'malformed_payment_header' })
+        return
+      }
+
       // Extract payer public key from the mppx Payment authorization header before
       // the mppx library consumes it. The Payment bearer credential JSON contains
       // a `sender` field with the payer's Stellar G... public key.
@@ -157,12 +184,22 @@ export function createMppChargeHandler(opts: MppChargeHandlerOptions): RequestHa
           ) => (input: globalThis.Request) => Promise<{ status: 402 | 200; challenge?: globalThis.Response; withReceipt?: (r: globalThis.Response) => globalThis.Response }>
         }
       )['stellar/charge']
-      const result = await handler({
-        amount: amountHumanReadable,
-        currency: assetContract,
-        recipient,
-        description: opts.manifest.name,
-      })(fetchReq)
+      let result: Awaited<ReturnType<ReturnType<typeof handler>>>
+      try {
+        result = await handler({
+          amount: amountHumanReadable,
+          currency: assetContract,
+          recipient,
+          description: opts.manifest.name,
+        })(fetchReq)
+      } catch (decodeErr) {
+        // The mppx decoder can throw on malformed payment headers (invalid
+        // base64, truncated JSON, unexpected types). Surface a clean 400 rather
+        // than leaking a 500 with a stack trace.
+        logger.warn?.('mpp-charge: failed to decode payment header', decodeErr)
+        res.status(400).json({ error: 'malformed_payment_header' })
+        return
+      }
 
       if (result.status === 402) {
         const challenge = result.challenge!
@@ -180,32 +217,106 @@ export function createMppChargeHandler(opts: MppChargeHandlerOptions): RequestHa
         receiptHeaders[k] = v
       })
 
-      // Extract tx hash from receipt headers if available
-      const receiptHeader = receipt.headers.get('payment-receipt')
+      // Extract tx hash from receipt headers if available.
+      // Probing candidate headers (standard payment-receipt, x-payment-response,
+      // x-stellar-tx-hash, mppx) ensures onSettled is not skipped when alternative
+      // header formats are emitted.
+      const RECEIPT_HEADER_CANDIDATES = [
+        'payment-receipt',
+        'x-payment-response',
+        'x-stellar-tx-hash',
+        'mppx',
+      ] as const
+
       let reference: string | undefined
-      if (receiptHeader) {
+      for (const headerName of RECEIPT_HEADER_CANDIDATES) {
+        const raw = receipt.headers.get(headerName)
+        if (!raw) continue
+
+        let parsedJson: Record<string, unknown> | null = null
         try {
-          const parsed = JSON.parse(
-            Buffer.from(receiptHeader, 'base64').toString('utf8'),
-          ) as { reference?: string }
-          reference = parsed.reference
+          const decoded = Buffer.from(raw, 'base64').toString('utf8')
+          parsedJson = JSON.parse(decoded) as Record<string, unknown>
         } catch {
-          // non-fatal — receipt is opaque/unparseable
+          try {
+            parsedJson = JSON.parse(raw) as Record<string, unknown>
+          } catch {
+            // Not JSON
+          }
+        }
+
+        if (parsedJson && typeof parsedJson === 'object') {
+          const extracted =
+            parsedJson.reference ??
+            parsedJson.txHash ??
+            parsedJson.tx_hash ??
+            parsedJson.hash
+          if (typeof extracted === 'string' && extracted.trim()) {
+            reference = extracted.trim()
+            break
+          } else {
+            logger('warn', `[mpp-charge] malformed receipt header ${headerName}: missing reference key`)
+          }
+        } else if (typeof raw === 'string' && raw.trim()) {
+          reference = raw.trim()
+          break
         }
       }
+
+      // Check request context and incoming request headers if still not found
+      if (!reference) {
+        for (const headerName of RECEIPT_HEADER_CANDIDATES) {
+          const reqHeader = req.headers[headerName]
+          const raw = Array.isArray(reqHeader) ? reqHeader[0] : reqHeader
+          if (!raw) continue
+          try {
+            const decoded = Buffer.from(raw, 'base64').toString('utf8')
+            const parsed = JSON.parse(decoded) as Record<string, unknown>
+            const extracted = parsed.reference ?? parsed.txHash ?? parsed.tx_hash ?? parsed.hash
+            if (typeof extracted === 'string' && extracted.trim()) {
+              reference = extracted.trim()
+              break
+            }
+          } catch {
+            if (typeof raw === 'string' && raw.trim()) {
+              reference = raw.trim()
+              break
+            }
+          }
+        }
+      }
+
+      // Check mppx result object or request context
+      if (!reference) {
+        const resObj = result as Record<string, unknown>
+        const ctxRef =
+          resObj.reference ??
+          resObj.txHash ??
+          resObj.tx_hash ??
+          (receipt as unknown as Record<string, unknown>).reference ??
+          (receipt as unknown as Record<string, unknown>).txHash ??
+          (req as unknown as Record<string, unknown>).txHash ??
+          (req as unknown as Record<string, unknown>).reference
+        if (typeof ctxRef === 'string' && ctxRef.trim()) {
+          reference = ctxRef.trim()
+        }
+      }
+
+      // Deterministic fallback reference if payment succeeded but reference couldn't be extracted
+      const settledRef = reference ?? (idempotencyKey ? `settled:${idempotencyKey}` : '')
 
       // Record the settlement so a retry of this exact charge is deduped.
       if (idempotencyKey) {
         try {
           await seenTxStore.set(idempotencyKey, {
-            txHash: reference ?? null,
+            txHash: reference ?? (settledRef || null),
             headers: receiptHeaders,
             createdAt: Date.now(),
           })
         } catch (setErr) {
           if (opts.fallbackSeenTxStore) {
             await opts.fallbackSeenTxStore.set(idempotencyKey, {
-              txHash: reference ?? null,
+              txHash: reference ?? (settledRef || null),
               headers: receiptHeaders,
               createdAt: Date.now(),
             })
@@ -215,8 +326,8 @@ export function createMppChargeHandler(opts: MppChargeHandlerOptions): RequestHa
         }
       }
 
-      if (reference && opts.onSettled) {
-        Promise.resolve().then(() => opts.onSettled!(reference!, opts.amount, 'mpp-charge', payerAddress)).catch(err => {
+      if (opts.onSettled) {
+        Promise.resolve().then(() => opts.onSettled!(settledRef, opts.amount, 'mpp-charge', payerAddress)).catch(err => {
           logger('error', '[mpp-charge] onSettled callback error', { error: err })
           opts.onCallbackError?.(err, 'onSettled')
         })
@@ -224,11 +335,6 @@ export function createMppChargeHandler(opts: MppChargeHandlerOptions): RequestHa
 
       next()
     } catch (err) {
-      if (err instanceof KikisAppNetworkError) {
-        res.setHeader('Retry-After', '5')
-        res.status(503).json({ error: 'Service Unavailable', reason: err.message })
-        return
-      }
       next(err)
     }
   }
